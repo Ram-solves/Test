@@ -1,0 +1,21 @@
+intent_agent (LLM): parsed the user’s text into {intent, fields}.
+
+dedupe (TF-IDF): detected if this is a near-duplicate of an open incident.
+
+ensure_min_fields (LLM Q): if something critical is missing, asks one short question and waits.
+
+triage_agent (LLM): picked category / priority / urgency.
+
+create (store): new incident row created; INC number assigned.
+
+user_comms_agent (LLM): the only node that talks to the user (first-touch, status, resolution).
+
+routing + kb (rules): set assignment_group and a KB article id.
+
+resolver (LLM+rule): auto-resolve common Access lockouts; otherwise draft steps.
+
+guardrail (rules inside resolve): prevents illegal closes (e.g., “Closed” without “Resolved”).
+
+status: short status message for a specific or last ticket.
+
+END: turn finished.
