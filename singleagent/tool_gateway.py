@@ -1,157 +1,181 @@
 #!/usr/bin/env python3
 """
-Tool Gateway (POC) — Access/Password Reset helpers for the agent
+Flask Tool Gateway — relaxed directory (any username works)
 
-Endpoints (all JSON, POST, Bearer-auth):
-  - /tools/v1/idp/status                 {} → { ok, incident|null, latency_ms }
-  - /tools/v1/itsm/dir/user_lookup       { user } → { exists, locked, sspr_enabled, failed_24h, last_login_utc }
-  - /tools/v1/itsm/dir/reset_password    { user, delivery? } → { ok, user, temp_password, policy, ttl_minutes, delivery, issued_utc }
+Endpoints
+- GET /health
+- POST /tools/v1/idp/status
+- POST /tools/v1/itsm/dir/user_lookup
+- POST /tools/v1/itsm/dir/reset_password
 
-Environment:
-  TOOL_API_KEY=dev-secret          # shared secret (agent uses the same)
-  PORT=8088                        # optional
-  IDP_STATUS_SCENARIO=ok|outage    # optional default simulation
+Auth
+- Send: Authorization: Bearer <TOOL_API_KEY>
 
-Run:
-  pip install flask
-  python tool_gateway.py
+Environment (optional)
+- TOOL_API_KEY           (default: 'dev-secret')
+- IDP_STATUS_SCENARIO    ('ok' | 'outage'; default: 'ok')
+- STRICT_DIRECTORY       ('0' relaxed [default], '1' strict)
 """
 
-import os, time, secrets, string, random
-from datetime import datetime, timedelta, timezone
+import os
+from datetime import datetime, timedelta
+import random
+import string
 from functools import wraps
+
 from flask import Flask, request, jsonify
+
+# -----------------------
+# Config
+# -----------------------
+TOOL_API_KEY = os.getenv("TOOL_API_KEY", "dev-secret")
+IDP_STATUS_SCENARIO = os.getenv("IDP_STATUS_SCENARIO", "ok").lower()
+STRICT_DIRECTORY = os.getenv("STRICT_DIRECTORY", "0") == "1"   # we default to RELAXED
 
 app = Flask(__name__)
 
-# --------------------------
-# Auth
-# --------------------------
+# -----------------------
+# Helpers
+# -----------------------
+def log(msg: str):
+    print(msg, flush=True)
+
+def _now_utc() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
 def auth(f):
     @wraps(f)
-    def wrapper(*args, **kwargs):
-        expected = os.getenv("TOOL_API_KEY", "dev-secret")
-        header = request.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            return jsonify({"error": "missing bearer auth"}), 401
-        token = header.split(" ", 1)[1]
-        if token != expected:
-            return jsonify({"error": "bad token"}), 401
+    def inner(*args, **kwargs):
+        hdr = request.headers.get("Authorization", "")
+        ok = hdr.startswith("Bearer ") and hdr.split(" ", 1)[1] == TOOL_API_KEY
+        if not ok:
+            return jsonify({"error": "unauthorized"}), 401
         return f(*args, **kwargs)
-    return wrapper
+    return inner
 
-def log(msg: str):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def _to_username(s: str) -> str:
+    """Normalize emails/usernames for dictionary lookup."""
+    s = (s or "").strip()
+    if "@" in s:
+        s = s.split("@", 1)[0]
+    return s.lower()
 
-# --------------------------
-# Health
-# --------------------------
+def _gen_password(n: int = 14) -> str:
+    """Strong temp password (contains upper/lower/digit/symbol)."""
+    rng = random.SystemRandom()
+    upper = rng.choice(string.ascii_uppercase)
+    lower = rng.choice(string.ascii_lowercase)
+    digit = rng.choice(string.digits)
+    symbol = rng.choice("!@#$%^&*-_+=?")
+    pool = string.ascii_letters + string.digits + "!@#$%^&*-_+=?"
+    rest = "".join(rng.choice(pool) for _ in range(max(0, n - 4)))
+    pwd = upper + lower + digit + symbol + rest
+    # shuffle
+    pwd_list = list(pwd)
+    rng.shuffle(pwd_list)
+    return "".join(pwd_list)
+
+# Demo seed users (used only if STRICT_DIRECTORY=1)
+_USERS = {
+    "ram":   {"exists": True, "locked": True,  "sspr_enabled": True,  "failed_24h": 3},
+    "jdoe":  {"exists": True, "locked": True,  "sspr_enabled": False, "failed_24h": 2},
+    "alice": {"exists": True, "locked": False, "sspr_enabled": True,  "failed_24h": 0},
+}
+
+# -----------------------
+# Endpoints
+# -----------------------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "tool-gateway", "time": datetime.utcnow().isoformat() + "Z"})
+    return jsonify({
+        "ok": True,
+        "service": "tool-gateway",
+        "directory_mode": "strict" if STRICT_DIRECTORY else "relaxed",
+        "idp_status_scenario": IDP_STATUS_SCENARIO,
+        "time_utc": _now_utc(),
+    })
 
-# --------------------------
-# 1) IdP status (mock)
-# --------------------------
 @app.post("/tools/v1/idp/status")
 @auth
 def idp_status():
     """
-    Simulate identity provider status (Okta/AAD).
-    Body: {} or {"simulate": "ok"|"outage"}
-    Env default: IDP_STATUS_SCENARIO=ok|outage
+    Body (optional): {"simulate": "ok" | "outage"}
+    If omitted, uses IDP_STATUS_SCENARIO env (default 'ok').
     """
-    body = request.json or {}
-    simulate = (body.get("simulate") or os.getenv("IDP_STATUS_SCENARIO", "ok")).lower()
+    data = request.json or {}
+    simulate = (data.get("simulate") or IDP_STATUS_SCENARIO or "ok").lower()
     ok = simulate != "outage"
     payload = {
         "ok": ok,
         "incident": None if ok else "auth-outage",
-        "latency_ms": random.randint(90, 220)
+        "latency_ms": random.randint(90, 230)
     }
     log(f"[idp.status] simulate={simulate} -> {payload}")
-    return jsonify(payload)
-
-# --------------------------
-# 2) User directory lookup (mock)
-# --------------------------
-_USERS = {
-    # username -> profile
-    "ram":   {"exists": True, "locked": True,  "sspr_enabled": True,  "failed_24h": 3},
-    "jdoe":  {"exists": True, "locked": True,  "sspr_enabled": False, "failed_24h": 7},
-    "alice": {"exists": True, "locked": False, "sspr_enabled": True,  "failed_24h": 0},
-}
-
-def _to_username(s: str) -> str:
-    s = (s or "").strip()
-    if "@" in s:  # email → username before '@'
-        s = s.split("@", 1)[0]
-    return s.lower()
+    return jsonify(payload), 200
 
 @app.post("/tools/v1/itsm/dir/user_lookup")
 @auth
 def user_lookup():
     """
-    Body: { "user": "ram" | "ram@corp.com" }
+    Body: {"user": "ram" | "ram@corp.com" | "anyname"}
+    RELAXED (default): unknown users -> exists:true, locked:true, sspr_enabled:true
+    STRICT_DIRECTORY=1: unknown users -> exists:false
     """
     data = request.json or {}
     user_raw = (data.get("user") or "").strip()
     if not user_raw:
         return jsonify({"error": "user required"}), 400
-    u = _to_username(user_raw)
 
-    profile = _USERS.get(u, {"exists": False, "locked": False, "sspr_enabled": False, "failed_24h": 0})
-    # add last_login timestamp
-    profile = dict(profile)  # copy
-    profile["user"] = user_raw
-    profile["last_login_utc"] = (datetime.utcnow() - timedelta(hours=random.randint(1, 24))).isoformat() + "Z"
+    ukey = _to_username(user_raw)
+    base = _USERS.get(ukey)
 
-    log(f"[dir.lookup] user={user_raw} -> {profile}")
-    return jsonify(profile)
+    if base is None:
+        if STRICT_DIRECTORY:
+            profile = {"exists": False, "locked": False, "sspr_enabled": False, "failed_24h": 0}
+        else:
+            # RELAXED: any name is treated as a valid, currently locked user with SSPR enabled
+            profile = {"exists": True, "locked": True, "sspr_enabled": True, "failed_24h": 1}
+    else:
+        profile = dict(base)
 
-# --------------------------
-# 3) Reset password (mock)
-# --------------------------
-def _gen_password(n: int = 14) -> str:
-    alphabet = string.ascii_lowercase + string.ascii_uppercase + string.digits + "!@#$%^&*-_"
-    while True:
-        p = "".join(secrets.choice(alphabet) for _ in range(n))
-        if (any(c.islower() for c in p)
-            and any(c.isupper() for c in p)
-            and any(c.isdigit() for c in p)
-            and any(c in "!@#$%^&*-_" for c in p)):
-            return p
+    profile.update({
+        "user": user_raw,
+        "last_login_utc": (datetime.utcnow() - timedelta(hours=random.randint(1, 24))).isoformat(timespec="seconds") + "Z"
+    })
+
+    log(f"[dir.lookup] {user_raw} -> {profile}")
+    return jsonify(profile), 200
 
 @app.post("/tools/v1/itsm/dir/reset_password")
 @auth
 def reset_password():
     """
-    Body: { "user": "ram" | "ram@corp.com", "delivery": "chat|sms|email" }
-    Returns FULL temp_password (POC ONLY — do not do this in prod).
+    Body: {"user": "<name or email>", "delivery": "chat" | "sms" | "email"}
+    Always issues a new temporary password (demo).
     """
     data = request.json or {}
-    user = (data.get("user") or "").strip()
+    user_raw = (data.get("user") or "").strip()
+    if not user_raw:
+        return jsonify({"error": "user required"}), 400
+
     delivery = (data.get("delivery") or "chat").lower()
-    if not user:
-        return jsonify({"ok": False, "error": "user required"}), 400
-
-    pwd = _gen_password(14)  # Full password returned (requested for POC)
-    resp = {
+    temp = _gen_password(14)
+    ttl = 15  # minutes
+    payload = {
         "ok": True,
-        "user": user,
-        "temp_password": pwd,                 # ← clear text, by request
+        "user": user_raw,
+        "temp_password": temp,
         "policy": "min12 + upper/lower/number/symbol",
-        "ttl_minutes": 15,
+        "ttl_minutes": ttl,
         "delivery": delivery,
-        "issued_utc": datetime.utcnow().isoformat() + "Z",
+        "issued_utc": _now_utc(),
     }
-    log(f"[dir.reset] user={user} -> temp_password={pwd}")
-    return jsonify(resp)
+    log(f"[dir.reset] user={user_raw} delivery={delivery} -> temp={temp}")
+    return jsonify(payload), 200
 
-# --------------------------
-# Boot
-# --------------------------
+# -----------------------
+# Main
+# -----------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8088"))
-    log(f"Starting Tool Gateway on 0.0.0.0:{port} (debug=False, reloader=False)")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    log("Serving Flask app 'tool_gateway' (relaxed directory by default)")
+    app.run(host="0.0.0.0", port=8088, debug=False)
