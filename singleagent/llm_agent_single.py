@@ -336,6 +336,16 @@ def main():
 
     # Persist CSV
     store.snapshot()
+# at bottom of sn_langgraph_llm.py
+def compile_graph():
+    """Compile and cache the LangGraph once, return it for callers (Streamlit/UI)."""
+    global _COMPILED
+    try:
+        return _COMPILED
+    except NameError:
+        pass
+    _COMPILED = build_graph().compile()
+    return _COMPILED
 
 if __name__ == "__main__":
     main()
