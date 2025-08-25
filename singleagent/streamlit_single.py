@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
 """
-Streamlit — Access Lockout Agent (LLM + Tools) POC
+Streamlit — Access Lockout Agent (LLM + Tools), simplified
 
-What it shows:
-- Chat box for free text (e.g., "I'm locked out. I am john.smith")
-- LLM extracts intent + username and writes comms
-- Agent calls live tools on your Flask gateway:
-    /tools/v1/idp/status
-    /tools/v1/itsm/dir/user_lookup
-    /tools/v1/itsm/dir/reset_password
-- Displays: reply, action trace, tool I/O, incident snapshot, flow diagram, KPIs
+What you see:
+- Agent Acknowledgement (first reply)
+- Agent Resolution (final reply; contains the temporary password on success)
+- Action Trace
+- Tool Calls (request/response JSONs)
+- Incident Snapshot
+- Flow Diagram
+- KPIs (updated correctly even if not auto-resolved)
 
-Requirements:
-1) tool_gateway.py running locally (or set TOOL_GATEWAY_URL / TOOL_API_KEY)
-2) Azure OpenAI creds (env or Streamlit secrets):
-   AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT
+No IdP toggle. No username override.
+Username is parsed from the free-text message.
 """
 
-import os
-import time
-import json
-import re
-import requests
-import streamlit as st
+import os, time, json, re, requests, streamlit as st
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
@@ -45,12 +38,11 @@ DEFAULT_TOOL_KEY = cfg("TOOL_API_KEY", "dev-secret")
 # ----------------------------
 from openai import AzureOpenAI
 _client = None
-
 def get_client():
     global _client
     if _client is None:
         if not all([AZ_ENDPOINT, AZ_KEY, AZ_VERSION, AZ_DEPLOYMENT]):
-            st.error("Azure OpenAI credentials missing. Set env or Streamlit secrets.")
+            st.error("Azure OpenAI credentials missing. Set env or .streamlit/secrets.toml")
             st.stop()
         _client = AzureOpenAI(
             api_key=AZ_KEY,
@@ -63,10 +55,6 @@ def get_client():
 # LLM helpers
 # ----------------------------
 def llm_json(system_prompt: str, user_prompt: str, tag: str, max_tokens: int = 300) -> Dict[str, Any]:
-    """
-    Call Azure OpenAI with response_format=json_object.
-    Adds 'JSON' guard to satisfy Azure. Falls back to best-effort parse if needed.
-    """
     sys_full = (
         "You are a JSON-only API. Always reply with a single valid JSON object and nothing else. "
         "The word JSON is present here to satisfy API constraints. Use only double quotes.\n\n" + system_prompt
@@ -85,7 +73,7 @@ def llm_json(system_prompt: str, user_prompt: str, tag: str, max_tokens: int = 3
         txt = (resp.choices[0].message.content or "").strip()
         return json.loads(txt)
     except Exception:
-        # Retry without response_format
+        # retry without response_format
         try:
             resp = c.chat.completions.create(
                 model=AZ_DEPLOYMENT,
@@ -104,7 +92,7 @@ def llm_json(system_prompt: str, user_prompt: str, tag: str, max_tokens: int = 3
         except Exception:
             return {}
 
-def llm_text(system_prompt: str, user_prompt: str, max_tokens: int = 200) -> str:
+def llm_text(system_prompt: str, user_prompt: str, max_tokens: int = 180) -> str:
     c = get_client()
     try:
         resp = c.chat.completions.create(
@@ -123,21 +111,10 @@ def llm_text(system_prompt: str, user_prompt: str, max_tokens: int = 200) -> str
 # ----------------------------
 def extract_username(text: str) -> str:
     t = (text or "").strip()
-
-    # email wins
     m = re.search(r'[\w\.\-]+@[\w\.\-]+\.\w+', t)
-    if m:
-        return m.group(0)
-
-    # labeled username
-    m = re.search(
-        r'\b(?:i am|iam|this is|user(?:name)?(?: is)?|login)\s*[:\-]?\s*([A-Za-z][A-Za-z0-9\.\-_]{1,})\b',
-        t, re.IGNORECASE
-    )
-    if m:
-        return m.group(1)
-
-    # bare token fallback (avoid single letters)
+    if m: return m.group(0)
+    m = re.search(r'\b(?:i am|iam|this is|user(?:name)?(?: is)?|login)\s*[:\-]?\s*([A-Za-z][A-Za-z0-9\.\-_]{1,})\b', t, re.IGNORECASE)
+    if m: return m.group(1)
     m = re.search(r'\b([A-Za-z][A-Za-z0-9\.\-_]{2,})\b', t)
     return m.group(1) if m else ""
 
@@ -149,7 +126,7 @@ if "incidents" not in st.session_state:
 if "kpis" not in st.session_state:
     st.session_state["kpis"] = {"total": 0, "closed": 0, "auto_resolved": 0}
 if "tool_logs" not in st.session_state:
-    st.session_state["tool_logs"] = []  # per-run request/response logs
+    st.session_state["tool_logs"] = []
 
 def _now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def gen_inc_number(): return f"INC{100000 + len(st.session_state['incidents'])}"
@@ -159,18 +136,14 @@ def gen_inc_number(): return f"INC{100000 + len(st.session_state['incidents'])}"
 # ----------------------------
 def ping_gateway(base_url: str) -> Dict[str, Any]:
     url = base_url.rstrip("/") + "/health"
-    t0 = time.perf_counter()
-    out = {"ok": False, "elapsed_ms": None}
+    t0 = time.perf_counter(); out = {"ok": False, "elapsed_ms": None}
     try:
         r = requests.get(url, timeout=2.5)
         out["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         if r.status_code == 200:
-            body = r.json()
-            out["ok"] = bool(body.get("ok"))
-            out["body"] = body
+            body = r.json(); out["ok"] = bool(body.get("ok")); out["body"] = body
         else:
-            out["status_code"] = r.status_code
-            out["text"] = r.text[:300]
+            out["status_code"] = r.status_code; out["text"] = r.text[:300]
     except Exception as e:
         out["error"] = str(e)
     return out
@@ -218,13 +191,6 @@ def llm_intent_and_user(text: str) -> Dict[str, Any]:
     return out
 
 def llm_plan_action(context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Decide next action based on tool results.
-    Rules:
-      - if idp_ok is false -> route_identity
-      - elif username missing or lookup.exists is false -> ask_username
-      - else -> reset_password
-    """
     sys_p = (
         "You are a cautious IT agent planner. Decide the next step for an access reset. "
         "Rules: If idp_ok is false → route_identity. "
@@ -242,21 +208,19 @@ def llm_plan_action(context: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 # ----------------------------
-# One run of the agent
+# One run of the agent (returns ack + final)
 # ----------------------------
-def run_agent_once(user_text: str, idp_mode: str, base_url: str, api_key: str, username_override: str = "") -> Dict[str, Any]:
+def run_agent_once(user_text: str, base_url: str, api_key: str) -> Dict[str, Any]:
     actions: List[str] = []
     tool_logs_start = len(st.session_state["tool_logs"])
 
-    # 1) LLM intent + username
+    # 1) Understand
     iu = llm_intent_and_user(user_text)
     intent = iu.get("intent", "access_reset")
     username = iu.get("username") or extract_username(user_text)
-    if username_override.strip():
-        username = username_override.strip()
     actions.append("intent:access_reset")
 
-    # 2) Create incident
+    # 2) Create incident (+KPIs total)
     inc_number = gen_inc_number()
     incident = {
         "number": inc_number,
@@ -274,22 +238,22 @@ def run_agent_once(user_text: str, idp_mode: str, base_url: str, api_key: str, u
         "sla_due": "",
     }
     st.session_state["incidents"].append(incident)
+    st.session_state["kpis"]["total"] += 1  # count every new ticket
     actions.append(f"created:{inc_number}")
 
-    # 3) First-touch
+    # 3) First touch (LLM)
     ack = llm_text(
         "You write concise IT support acknowledgements. 2 sentences max.",
         f"Ticket: {inc_number}. Scenario: Access lockout/password reset. Write a short acknowledgement."
     )
-    reply = ack
     actions.append("user_update:first_touch")
 
-    # 4) IdP status
-    ok, idp_body, _ = call_tool(base_url, api_key, "/tools/v1/idp/status", {"simulate": "ok" if idp_mode == "OK" else "outage"})
+    # 4) IdP status (no UI toggle; just ask the tool)
+    ok, idp_body, _ = call_tool(base_url, api_key, "/tools/v1/idp/status", {})
     idp_ok = ok and bool(idp_body.get("ok", True))
     actions.append(f"idp_ok:{'True' if idp_ok else 'False'}")
 
-    # 5) Plan
+    # 5) Plan (and lookup if IdP ok)
     context = {"idp_ok": idp_ok, "username": username, "number": inc_number, "lookup": {}}
     if not idp_ok:
         plan = {"action": "route_identity", "reason": "idp outage"}
@@ -299,40 +263,42 @@ def run_agent_once(user_text: str, idp_mode: str, base_url: str, api_key: str, u
         context["lookup"] = lookup_body if lok else {"exists": False}
         plan = llm_plan_action(context)
 
-    # 6) Branch: outage
+    # 6) Branches
     if plan["action"] == "route_identity":
         incident["state"] = "In Progress"
         incident["assignment_group"] = "Identity"
-        reply = llm_text(
+        final = llm_text(
             "You write concise IT status notes. 2 sentences max.",
             f"Explain to the user that identity provider reports an outage; ticket {inc_number} is routed to Identity."
         )
         actions.extend(["routed:Identity", "worknote:idp_outage"])
         return {
-            "reply": reply,
+            "ack": ack,
+            "final": final,
             "actions": actions,
             "incident": incident,
             "tool_logs": st.session_state["tool_logs"][tool_logs_start:]
         }
 
-    # 7) Branch: missing/unknown user
-    if plan["action"] == "ask_username":
-        reply = "Please provide your username or email to proceed with the reset."
+    if plan["action"] == "ask_username" or not username:
+        final = "Please provide your username or email to proceed with the reset."
         actions.append("clarify:username")
         return {
-            "reply": reply,
+            "ack": ack,
+            "final": final,
             "actions": actions,
             "incident": incident,
             "tool_logs": st.session_state["tool_logs"][tool_logs_start:]
         }
 
-    # 8) Reset password
+    # 7) Reset + close
     rok, reset_body, _ = call_tool(base_url, api_key, "/tools/v1/itsm/dir/reset_password", {"user": username, "delivery": "chat"})
     if not rok:
-        reply = f"Could not issue a temporary password at this time. Your ticket {inc_number} remains in progress."
+        final = f"Could not issue a temporary password at this time. Your ticket {inc_number} remains in progress."
         actions.append("tool_error:reset_password")
         return {
-            "reply": reply,
+            "ack": ack,
+            "final": final,
             "actions": actions,
             "incident": incident,
             "tool_logs": st.session_state["tool_logs"][tool_logs_start:]
@@ -340,24 +306,20 @@ def run_agent_once(user_text: str, idp_mode: str, base_url: str, api_key: str, u
 
     temp_password = reset_body.get("temp_password", "")
     actions.extend(["tool_exec:reset_password", "worknote:reset_issued"])
-
-    # 9) Close
     incident["state"] = "Resolved"; incident["resolved_at"] = _now()
     incident["state"] = "Closed";   incident["closed_at"] = _now()
     actions.extend(["auto_resolved", "closed"])
 
-    # KPIs
-    st.session_state["kpis"]["total"] = len(st.session_state["incidents"])
-    st.session_state["kpis"]["closed"] = sum(1 for x in st.session_state["incidents"] if x.get("state") == "Closed")
+    # KPIs on closure
+    st.session_state["kpis"]["closed"] += 1
     st.session_state["kpis"]["auto_resolved"] += 1
 
-    # 10) Final comms
-    reply = llm_text(
+    final = llm_text(
         "You write concise IT resolutions. 2 sentences max.",
         f"Tell the user the temporary password and that ticket {inc_number} is closed. Password: {temp_password}. TTL: 15 minutes."
     )
-    if not reply or "password" not in reply.lower():
-        reply = (
+    if not final or "password" not in final.lower():
+        final = (
             f"A temporary password has been issued for {username}. "
             f"Ticket {inc_number} is now closed. "
             f"Your temporary password is: {temp_password}. "
@@ -365,7 +327,8 @@ def run_agent_once(user_text: str, idp_mode: str, base_url: str, api_key: str, u
         )
 
     return {
-        "reply": reply,
+        "ack": ack,
+        "final": final,
         "actions": actions,
         "incident": incident,
         "tool_logs": st.session_state["tool_logs"][tool_logs_start:]
@@ -375,14 +338,13 @@ def run_agent_once(user_text: str, idp_mode: str, base_url: str, api_key: str, u
 # UI
 # ----------------------------
 st.set_page_config(page_title="Access Lockout Agent (LLM + Tools)", layout="wide")
-st.title("Access Lockout Agent — LLM + Tools POC")
+st.title("Access Lockout Agent — LLM + Tools POC (Simplified)")
 
-# Sidebar controls
+# Sidebar: gateway and status
 with st.sidebar:
     st.header("Tool Gateway")
     gw_url = st.text_input("Gateway URL", value=DEFAULT_TOOL_URL, key="gw_url")
     gw_key = st.text_input("API key", value=DEFAULT_TOOL_KEY, key="gw_key")
-
     status = ping_gateway(gw_url)
     if status.get("ok"):
         st.write(f"Status: UP, {status.get('elapsed_ms')} ms")
@@ -390,17 +352,11 @@ with st.sidebar:
             st.json(status.get("body", {}))
     else:
         st.write("Status: DOWN")
-
-    st.divider()
-    idp_mode = st.radio("IdP status", ["OK", "Outage"], horizontal=True, index=0)
-    username_override = st.text_input("Username override (optional)", value="", key="username_override")
-    st.caption("Leave blank to parse from the message. Any name works if your tool server is in relaxed mode.")
-
     st.divider()
     if not all([AZ_ENDPOINT, AZ_KEY, AZ_VERSION, AZ_DEPLOYMENT]):
-        st.warning("Azure OpenAI credentials are missing. Set env or Streamlit secrets.")
+        st.warning("Azure OpenAI credentials are missing.")
 
-# Chat input
+# Chat
 default_prompt = "I'm locked out and need a password reset. My username is john.smith"
 user_text = st.text_area("User message", value=default_prompt, height=120)
 run_btn = st.button("Run Agent")
@@ -408,25 +364,20 @@ run_btn = st.button("Run Agent")
 col_left, col_right = st.columns([3, 2])
 
 if run_btn:
-    result = run_agent_once(
-        user_text=user_text,
-        idp_mode=idp_mode,
-        base_url=gw_url,
-        api_key=gw_key,
-        username_override=username_override,
-    )
+    result = run_agent_once(user_text=user_text, base_url=gw_url, api_key=gw_key)
 
     with col_left:
-        st.subheader("Agent Reply")
-        st.write(result["reply"])
+        st.subheader("Agent Acknowledgement")
+        st.write(result["ack"])
+
+        st.subheader("Agent Resolution")
+        st.write(result["final"])  # this is where the password shows up on success
 
         st.subheader("Action Trace")
         st.code(" -> ".join(result["actions"]))
 
         st.subheader("Flow Diagram")
-        taken = set()
-        for a in result["actions"]:
-            taken.add(a.split(":")[0])
+        taken = set(a.split(":")[0] for a in result["actions"])
         dot = [
             'digraph G {',
             'rankdir=LR;',
@@ -453,16 +404,10 @@ if run_btn:
 
     with col_right:
         st.subheader("Tool Calls")
-        logs = result["tool_logs"]
-        if not logs:
-            st.write("No tool calls recorded.")
-        else:
-            for i, rec in enumerate(logs, 1):
-                with st.expander(f"{i}. {rec['path']}  [{rec['status_code']}]  {rec['elapsed_ms']} ms", expanded=False):
-                    st.write("Request")
-                    st.json(rec["request"])
-                    st.write("Response")
-                    st.json(rec["response"])
+        for i, rec in enumerate(result["tool_logs"], 1):
+            with st.expander(f"{i}. {rec['path']}  [{rec['status_code']}]  {rec['elapsed_ms']} ms", expanded=False):
+                st.write("Request");  st.json(rec["request"])
+                st.write("Response"); st.json(rec["response"])
 
         st.subheader("Session KPIs")
         k = st.session_state["kpis"]
@@ -471,6 +416,5 @@ if run_btn:
         st.write(f"Total incidents: {k['total']}")
         st.write(f"Closed incidents: {k['closed']}")
         st.write(f"Auto-resolved percent: {auto_pct}")
-
 else:
-    st.info("Enter a user message and click Run Agent.")
+    st.info("Type any lockout message (with a name) and click Run Agent.")
